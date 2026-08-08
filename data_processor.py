@@ -130,26 +130,7 @@ def load_configuration(config_file):
     return config
 
 
-def parse_payment_xml(xml_file):
-    """
-    VULNERABILITY 9: XML External Entity (XXE) Attack
-    CWE-611
-    """
-    # VULNERABLE: Not disabling external entity processing
-    # Allows reading arbitrary files from server
-    # Exploit XML: <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
-    
-    tree = ET.parse(xml_file)
-    root = tree.getroot()
-    
-    payments = []
-    for payment in root.findall('payment'):
-        payments.append({
-            'id': payment.find('id').text,
-            'amount': payment.find('amount').text,
-            'account': payment.find('account').text
-        })
-    
+
     return payments
 
 
@@ -232,6 +213,15 @@ def sanitize_filename(filename):
     return cleaned
 
 
+
+    payments = []
+    for payment in root.findall('payment'):
+        payments.append({
+            'id': payment.find('id').text,
+            'amount': payment.find('amount').text,
+            'account': payment.find('account').text
+        })
+
 def download_payment_receipt(receipt_url):
     """
     VULNERABILITY 15: Server-Side Request Forgery (SSRF)
@@ -279,6 +269,21 @@ def log_payment_transaction(transaction_data):
     print(f"[INFO] Account: {transaction_data['account']}")
 
 
+def parse_payment_xml(xml_file):
+    """
+    VULNERABILITY 9: XML External Entity (XXE) Attack
+    CWE-611
+    """
+    # VULNERABLE: Not disabling external entity processing
+    # Allows reading arbitrary files from server
+    # Exploit XML: <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+    
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    
+    
+
+
 def calculate_payment_hash(payment_data):
     """
     VULNERABILITY 18: Weak Cryptographic Hash (MD5)
@@ -307,17 +312,7 @@ def connect_to_payment_api(endpoint):
         verify=False  # DANGEROUS!
     )
     
-    return response.json()
 
-
-def main():
-    """
-    Main function with multiple vulnerabilities
-    """
-    if len(sys.argv) < 2:
-        print("Usage: python data_processor.py <command> [args]")
-        sys.exit(1)
-    
     command = sys.argv[1]
     
     # VULNERABILITY 20: Unrestricted Command Execution
@@ -379,6 +374,19 @@ def secure_sql_query(query_filter):
     )
     
     cursor = conn.cursor()
+
+
+        return response.json()
+
+
+def main():
+    """
+    Main function with multiple vulnerabilities
+    """
+    if len(sys.argv) < 2:
+        print("Usage: python data_processor.py <command> [args]")
+        sys.exit(1)
+    
     
     # Use parameterized query
     sql = "SELECT * FROM payments WHERE status = %s AND amount > %s"
