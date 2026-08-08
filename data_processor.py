@@ -15,16 +15,6 @@ import hmac
 import base64
 import sqlite3
 import logging
-import hashlib
-import threading
-from functools import wraps
-from datetime import datetime, timedelta
-
-from flask import (
-    Flask, request, jsonify, redirect, render_template_string,
-    make_response, session, g, send_file
-)
-
 # =====================================================================
 # APP CONFIGURATION
 # =====================================================================
@@ -85,20 +75,7 @@ def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         cookie = request.cookies.get('session_token')
-        if not cookie:
-            return jsonify({'error': 'Not authenticated'}), 401
-
-        session_data = read_session_cookie(cookie)
-        if not session_data:
-            return jsonify({'error': 'Invalid session'}), 401
-
-        # VULNERABLE: role comes from the untrusted cookie
-        g.current_user = session_data
-        return f(*args, **kwargs)
-    return decorated
-
-
-def require_admin(f):
+        if not
     """
     CRITICAL — CWE-639: Authorization Bypass Through User-Controlled Key
 
@@ -130,17 +107,25 @@ def require_admin(f):
 
     user = db.execute(query).fetchone()
 
+
+     cookie:
+            return jsonify({'error': 'Not authenticated'}), 401
+
+        session_data = read_session_cookie(cookie)
+        if not session_data:
+            return jsonify({'error': 'Invalid session'}), 401
+
+        # VULNERABLE: role comes from the untrusted cookie
+        g.current_user = session_data
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_admin(f):
+
     if user:
         token = create_session_cookie(user['id'], user['role'])
-        resp = make_response(jsonify({
-            'status': 'success',
-            'user_id': user['id'],
-            'role': user['role'],
-            'internal_id': user['ssn']  # VULNERABLE: leaks SSN in login response
-        }))
-        # VULNERABLE: cookie flags missing — no Secure, no HttpOnly, no SameSite
-        resp.set_cookie('session_token', token)
-        return resp
+        resp = make_response
     else:
         # VULNERABLE: different error for unknown user vs wrong password
         check_user = db.execute(
@@ -230,6 +215,16 @@ def reset_password():
     return jsonify({'status': 'password_updated'})
 
 
+(jsonify({
+            'status': 'success',
+            'user_id': user['id'],
+            'role': user['role'],
+            'internal_id': user['ssn']  # VULNERABLE: leaks SSN in login response
+        }))
+        # VULNERABLE: cookie flags missing — no Secure, no HttpOnly, no SameSite
+        resp.set_cookie('session_token', token)
+        return resp
+
 # =====================================================================
 # ENDPOINTS — PAYMENTS
 # =====================================================================
@@ -241,16 +236,6 @@ def list_payments():
     CRITICAL — CWE-639: IDOR — any user sees any user's payments
     MAJOR   — CWE-200: Over-fetching sensitive columns
     """
-    # VULNERABLE: user_id from query string, not from session
-    user_id = request.args.get('user_id', g.current_user['user_id'])
-
-    db = get_db()
-
-    # VULNERABLE: SQL injection + IDOR (no ownership check)
-    rows = db.execute(
-        f"SELECT * FROM payments WHERE user_id = '{user_id}'"
-    ).fetchall()
-
     # VULNERABLE: returns full card numbers, CVVs, SSN in response
     return jsonify([dict(row) for row in rows])
 
@@ -285,6 +270,16 @@ def create_payment():
 
 
 
+    # VULNERABLE: user_id from query string, not from session
+    user_id = request.args.get('user_id', g.current_user['user_id'])
+
+    db = get_db()
+
+    # VULNERABLE: SQL injection + IDOR (no ownership check)
+    rows = db.execute(
+        f"SELECT * FROM payments WHERE user_id = '{user_id}'"
+    ).fetchall()
+
     
     recipient = data.get('recipient')
     card_number = data.get('card_number')
@@ -314,6 +309,18 @@ def refund_payment(payment_id):
     CRITICAL — CWE-799: No Business Logic Validation (double refund)
     """
     db = get_db()
+
+
+    # VULNERABLE: user_id from query string, not from session
+    user_id = request.args.get('user_id', g.current_user['user_id'])
+
+    db = get_db()
+
+    # VULNERABLE: SQL injection + IDOR (no ownership check)
+    rows = db.execute(
+        f"SELECT * FROM payments WHERE user_id = '{user_id}'"
+    ).fetchall()
+
 
     # VULNERABLE: no ownership check, no check if already refunded
     payment = db.execute(
