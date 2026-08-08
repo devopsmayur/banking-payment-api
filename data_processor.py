@@ -1,734 +1,728 @@
 #!/usr/bin/env python3
 """
-Payment Data Processor - INTENTIONALLY VULNERABLE FOR DEMO
+Payment Gateway API & Auth Service - INTENTIONALLY VULNERABLE FOR DEMO
 
-Vulnerabilities:
-1. Command Injection
-2. SQL Injection
-3. Path Traversal
-4. Hardcoded Credentials
-5. Insecure Deserialization
-6. XXE (XML External Entity)
-7. Unsafe YAML loading
-8. Weak Crypto (MD5)
-9. Disabled SSL
-10. SSRF
-11. Log Injection
-12. Race Condition
-13. NoSQL Injection
-14. Insufficient Input Validation
---- NEW CRITICAL / MAJOR ---
-15. JWT None Algorithm
-16. Insecure Temp File
-17. Arbitrary Code Execution via exec()
-18. Mass Assignment / Object Injection
-19. Cleartext Password Storage
-20. Unvalidated Redirect
-21. Buffer-style ReDoS
-22. Improper Access Control
-23. Sensitive Data in URL
-24. Weak Random for Tokens
-25. Debug Mode / Stack Trace Exposure
-26. Prototype Pollution via merge
-27. Unrestricted File Upload
-28. Integer Overflow in Payment Amount
-29. Missing Rate Limiting on Auth
-30. Hardcoded Encryption Key + ECB Mode
+This file simulates a Flask-based API layer for a banking/payments
+platform. Every endpoint and helper contains at least one exploitable
+vulnerability spanning OWASP Top 10 2021, PCI-DSS, and CWE categories.
 """
 
 import os
-import sys
-import subprocess
-import mysql.connector
-import pickle
-import yaml
-import xml.etree.ElementTree as ET
-import hashlib
-import json
-import random
-import string
-import tempfile
 import re
+import json
+import time
+import hmac
+import base64
+import sqlite3
+import logging
+import hashlib
+import threading
+from functools import wraps
+from datetime import datetime, timedelta
 
-# ============================================
-# VULNERABILITY 1: Hardcoded Database Credentials
-# CWE-798
-# ============================================
-DB_HOST = "prod-db.bank.internal"
-DB_USER = "admin"
-DB_PASSWORD = "Pr0dP@ssw0rd123!"  # VULNERABLE!
-DB_NAME = "payments_db"
+from flask import (
+    Flask, request, jsonify, redirect, render_template_string,
+    make_response, session, g, send_file
+)
 
-# VULNERABILITY 2: Hardcoded API Keys
-AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"  # VULNERABLE!
-AWS_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # VULNERABLE!
+# =====================================================================
+# APP CONFIGURATION
+# =====================================================================
 
-# VULNERABILITY (NEW): Hardcoded JWT Secret + Encryption Key
-JWT_SECRET = "super-secret-jwt-key-12345"  # VULNERABLE!
-ENCRYPTION_KEY = b"0123456789ABCDEF"  # VULNERABLE! Hardcoded 128-bit key
+app = Flask(__name__)
 
-# VULNERABILITY (NEW): Debug mode enabled in production
-DEBUG_MODE = True  # VULNERABLE! Exposes stack traces and internal state
+# CRITICAL — CWE-798: Hardcoded secret key (session signing)
+app.secret_key = "flask-secret-change-me-later"  # VULNERABLE!
+
+# CRITICAL — CWE-215: Debug mode in production
+app.debug = True  # VULNERABLE! Enables Werkzeug debugger + stack traces
+
+# MAJOR — CWE-942: Overly permissive CORS
+ALLOWED_ORIGINS = "*"  # VULNERABLE! Any origin can call this API
+
+# CRITICAL — CWE-798: Hardcoded credentials block
+MASTER_API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"  # VULNERABLE!
+STRIPE_SECRET = "sk_live_51HG4abc123fakefakefake"  # VULNERABLE!
+TWILIO_AUTH_TOKEN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"  # VULNERABLE!
+SENDGRID_KEY = "SG.xxxxxxxxxx.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"  # VULNERABLE!
+DB_CONNECTION_STRING = "postgresql://payments_admin:P@yM3ntsPr0d!@prod-rds.bank.internal:5432/payments"  # VULNERABLE!
+
+# MAJOR — CWE-532: Logging sensitive data
+logging.basicConfig(
+    level=logging.DEBUG,  # VULNERABLE! DEBUG level in production
+    format='%(asctime)s %(levelname)s %(message)s',
+    filename='/var/log/payment_api.log'
+)
 
 
-def process_payment_file(filename):
+# =====================================================================
+# DATABASE HELPERS
+# =====================================================================
+
+def get_db():
+    """Return a raw SQLite connection with no parameterization helper."""
+    if 'db' not in g:
+        g.db = sqlite3.connect('/var/data/payments.db')
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+# =====================================================================
+# AUTH / SESSION
+# =====================================================================
+
+def create_session_cookie(user_id, role):
     """
-    VULNERABILITY 3: Command Injection
-    CWE-78
-    User input directly used in shell command
-    """
-    # VULNERABLE: User-controlled filename in shell command
-    command = f"cat /data/payments/{filename} | wc -l"
+    CRITICAL — CWE-565: Cookie Without Integrity Check
+    CRITICAL — CWE-315: Cleartext Storage in Cookie
 
+    Session payload is base64-encoded JSON — not signed, not encrypted.
+    Attacker can decode, change role to 'admin', re-encode.
+    """
+    payload = json.dumps({
+        'user_id': user_id,
+        'role': role,
+        'login_time': time.time()
+    })
+    # VULNERABLE: no HMAC, no encryption — trivially forgeable
+    return base64.b64encode(payload.encode()).decode()
+
+
+def read_session_cookie(cookie_value):
+    """Blindly trusts the cookie content."""
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        print(f"Processed {result.stdout.strip()} records")
-        return result.stdout
-    except Exception as e:
-        print(f"Error: {e}")
+        payload = base64.b64decode(cookie_value)
+        return json.loads(payload)
+    except Exception:
         return None
 
 
-def export_payments_to_csv(output_file, query_filter):
+def require_auth(f):
     """
-    VULNERABILITY 4: SQL Injection
-    CWE-89
-    Direct string concatenation in SQL query
+    MAJOR — CWE-306: Missing Authentication for Critical Function
+
+    Decorator trusts whatever the cookie says. No server-side session
+    store, no signature verification.
     """
-    try:
-        conn = mysql.connector.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME
-        )
-        cursor = conn.cursor()
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        cookie = request.cookies.get('session_token')
+        if not cookie:
+            return jsonify({'error': 'Not authenticated'}), 401
 
-        # VULNERABLE: SQL Injection via string concatenation
-        sql = f"SELECT * FROM payments WHERE {query_filter}"
+        session_data = read_session_cookie(cookie)
+        if not session_data:
+            return jsonify({'error': 'Invalid session'}), 401
 
-        print(f"Executing SQL: {sql}")  # VULNERABLE: Logging SQL queries
-
-        cursor.execute(sql)
-        results = cursor.fetchall()
-
-        # VULNERABILITY 5: Path Traversal
-        with open(output_file, 'w') as f:
-            for row in results:
-                f.write(','.join(str(col) for col in row) + '\n')
-
-        cursor.close()
-        conn.close()
-
-        print(f"Exported {len(results)} payments to {output_file}")
-
-    except Exception as e:
-        # VULNERABILITY 6: Error Information Disclosure
-        print(f"Database error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        # VULNERABLE: role comes from the untrusted cookie
+        g.current_user = session_data
+        return f(*args, **kwargs)
+    return decorated
 
 
-def generate_report(report_type, parameters):
+def require_admin(f):
     """
-    VULNERABILITY 7: Command Injection via system()
-    CWE-78
+    CRITICAL — CWE-639: Authorization Bypass Through User-Controlled Key
+
+    Checks role from the cookie the client controls.
     """
-    if report_type == "daily":
-        cmd = f"python3 /opt/reports/daily_report.py {parameters}"
-    elif report_type == "monthly":
-        cmd = f"python3 /opt/reports/monthly_report.py {parameters}"
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        cookie = request.cookies.get('session_token')
+        session_data = read_session_cookie(cookie)
+
+        # VULNERABLE: attacker sets role='admin' in forged cookie
+        if not session_data or session_data.get('role') != 'admin':
+            return jsonify({'error': 'Admin required'}), 403
+
+        g.current_user = session_data
+        return f(*args, **kwargs)
+    return decorated
+
+
+# =====================================================================
+# ENDPOINTS — AUTHENTICATION
+# =====================================================================
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """
+    CRITICAL — CWE-89:  SQL Injection
+    CRITICAL — CWE-521: Weak Password Requirements
+    MAJOR   — CWE-307: No Rate Limiting
+    MAJOR   — CWE-204: User Enumeration via Response Difference
+    """
+    data = request.get_json()
+    username = data.get('username', '')
+    password = data.get('password', '')
+
+    db = get_db()
+
+    # VULNERABLE: SQL injection — classic string formatting
+    query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
+    logging.info(f"Login attempt: {query}")  # VULNERABLE: logs full query w/ password
+
+    user = db.execute(query).fetchone()
+
+    if user:
+        token = create_session_cookie(user['id'], user['role'])
+        resp = make_response(jsonify({
+            'status': 'success',
+            'user_id': user['id'],
+            'role': user['role'],
+            'internal_id': user['ssn']  # VULNERABLE: leaks SSN in login response
+        }))
+        # VULNERABLE: cookie flags missing — no Secure, no HttpOnly, no SameSite
+        resp.set_cookie('session_token', token)
+        return resp
     else:
-        cmd = f"python3 /opt/reports/custom_report.py {parameters}"
+        # VULNERABLE: different error for unknown user vs wrong password
+        check_user = db.execute(
+            f"SELECT id FROM users WHERE username = '{username}'"
+        ).fetchone()
 
-    os.system(cmd)
+        if check_user:
+            return jsonify({'error': 'Incorrect password'}), 401  # user exists
+        else:
+            return jsonify({'error': 'User not found'}), 404  # user doesn't exist
 
 
-def load_configuration(config_file):
+@app.route('/api/register', methods=['POST'])
+def register():
     """
-    VULNERABILITY 8: Insecure Deserialization
-    CWE-502
+    CRITICAL — CWE-256: Cleartext Password Storage
+    CRITICAL — CWE-89:  SQL Injection
+    MAJOR   — CWE-521: No Password Complexity Enforcement
     """
-    with open(config_file, 'rb') as f:
-        config = pickle.load(f)  # DANGEROUS!
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    email = data.get('email')
 
-    return config
+    db = get_db()
+
+    # VULNERABLE: no password length / complexity check at all
+    # VULNERABLE: storing plaintext password
+    # VULNERABLE: SQL injection in INSERT
+    db.execute(
+        f"INSERT INTO users (username, password, email, role) "
+        f"VALUES ('{username}', '{password}', '{email}', 'user')"
+    )
+    db.commit()
+
+    logging.info(f"New user registered: {username} / {password}")  # VULNERABLE: logs password
+
+    return jsonify({'status': 'created', 'username': username}), 201
 
 
-def load_yaml_config(yaml_file):
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
     """
-    VULNERABILITY 10: Unsafe YAML Deserialization
-    CWE-502
+    CRITICAL — CWE-640: Weak Password Recovery
+    MAJOR   — CWE-330: Predictable Reset Token
+    MAJOR   — CWE-200: PII in Logs
     """
-    with open(yaml_file, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)  # Still vulnerable
+    email = request.get_json().get('email')
+    db = get_db()
 
-    return config
+    user = db.execute(
+        f"SELECT * FROM users WHERE email = '{email}'"  # SQL injection
+    ).fetchone()
+
+    if not user:
+        # VULNERABLE: confirms whether email exists
+        return jsonify({'error': f'No account found for {email}'}), 404
+
+    # VULNERABLE: token derived from predictable values
+    token = hashlib.md5(f"{email}{int(time.time())}".encode()).hexdigest()
+
+    # VULNERABLE: logs PII
+    logging.info(f"Password reset for {email}: token={token}")
+
+    # VULNERABLE: token never expires, no single-use enforcement
+    db.execute(f"UPDATE users SET reset_token = '{token}' WHERE email = '{email}'")
+    db.commit()
+
+    return jsonify({
+        'status': 'reset_link_sent',
+        'debug_token': token  # VULNERABLE: exposes token in API response
+    })
 
 
-def execute_data_migration(source_db, migration_script):
+@app.route('/api/reset-password', methods=['POST'])
+def reset_password():
     """
-    VULNERABILITY 11: OS Command Injection with eval()
-    CWE-95
+    CRITICAL — CWE-620: Unverified Password Change
+
+    No old-password check, no token expiry, no single-use guard.
     """
-    migration_params = {
-        'source': source_db,
-        'target': DB_NAME,
-        'credentials': {'user': DB_USER, 'password': DB_PASSWORD}
-    }
+    data = request.get_json()
+    token = data.get('token')
+    new_password = data.get('new_password')
 
-    result = eval(f"execute_migration({migration_params}, '{migration_script}')")
+    db = get_db()
 
-    return result
+    # VULNERABLE: SQL injection + no expiry check
+    user = db.execute(
+        f"SELECT * FROM users WHERE reset_token = '{token}'"
+    ).fetchone()
+
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 400
+
+    # VULNERABLE: password stored in cleartext, old token not cleared
+    db.execute(f"UPDATE users SET password = '{new_password}' WHERE id = {user['id']}")
+    db.commit()
+
+    return jsonify({'status': 'password_updated'})
 
 
-def backup_to_s3(bucket_name, file_path):
+# =====================================================================
+# ENDPOINTS — PAYMENTS
+# =====================================================================
+
+@app.route('/api/payments', methods=['GET'])
+@require_auth
+def list_payments():
     """
-    VULNERABILITY 12: Hardcoded AWS Credentials + Command Injection
+    CRITICAL — CWE-639: IDOR — any user sees any user's payments
+    MAJOR   — CWE-200: Over-fetching sensitive columns
     """
-    os.environ['AWS_ACCESS_KEY_ID'] = AWS_ACCESS_KEY
-    os.environ['AWS_SECRET_ACCESS_KEY'] = AWS_SECRET_KEY
+    # VULNERABLE: user_id from query string, not from session
+    user_id = request.args.get('user_id', g.current_user['user_id'])
 
-    command = f"aws s3 cp {file_path} s3://{bucket_name}/"
-    os.system(command)
+    db = get_db()
+
+    # VULNERABLE: SQL injection + IDOR (no ownership check)
+    rows = db.execute(
+        f"SELECT * FROM payments WHERE user_id = '{user_id}'"
+    ).fetchall()
+
+    # VULNERABLE: returns full card numbers, CVVs, SSN in response
+    return jsonify([dict(row) for row in rows])
 
 
-def search_payments(search_term):
+@app.route('/api/payments', methods=['POST'])
+@require_auth
+def create_payment():
     """
-    VULNERABILITY 13: NoSQL Injection (MongoDB)
+    CRITICAL — CWE-20:  Improper Input Validation
+    MAJOR   — CWE-190: Integer Overflow on Amount
+    MAJOR   — CWE-352: No CSRF Protection
     """
-    from pymongo import MongoClient
+    data = request.get_json()
 
-    client = MongoClient('mongodb://admin:M0ng0P@ss!@prod-mongo.bank.internal:27017/')
-    db = client['payments']
+    amount = data.get('amount')
+    recipient = data.get('recipient')
+    card_number = data.get('card_number')
 
-    results = db.payments.find({'description': search_term})
+    # VULNERABLE: no type check — amount could be string, negative, or huge
+    # VULNERABLE: no max-amount guard
+    # VULNERABLE: no CSRF token validation
 
-    return list(results)
+    db = get_db()
+    db.execute(
+        f"INSERT INTO payments (user_id, amount, recipient, card_number, status, created_at) "
+        f"VALUES ({g.current_user['user_id']}, {amount}, '{recipient}', '{card_number}', 'pending', datetime('now'))"
+    )
+    db.commit()
+
+    # VULNERABLE: logs full card number
+    logging.info(f"Payment created: user={g.current_user['user_id']} amount={amount} card={card_number}")
+
+    return jsonify({'status': 'created', 'amount': amount}), 201
 
 
-def sanitize_filename(filename):
+@app.route('/api/payments/<payment_id>/refund', methods=['POST'])
+@require_auth
+def refund_payment(payment_id):
     """
-    VULNERABILITY 14: Insufficient Input Validation
+    CRITICAL — CWE-639: IDOR — any user can refund any payment
+    CRITICAL — CWE-799: No Business Logic Validation (double refund)
     """
-    cleaned = filename.replace('../', '')
-    return cleaned
+    db = get_db()
+
+    # VULNERABLE: no ownership check, no check if already refunded
+    payment = db.execute(
+        f"SELECT * FROM payments WHERE id = {payment_id}"  # SQL injection
+    ).fetchone()
+
+    if not payment:
+        return jsonify({'error': 'Payment not found'}), 404
+
+    # VULNERABLE: no idempotency — can refund the same payment unlimited times
+    db.execute(f"UPDATE payments SET status = 'refunded' WHERE id = {payment_id}")
+    db.commit()
+
+    return jsonify({'status': 'refunded', 'payment_id': payment_id})
 
 
-def download_payment_receipt(receipt_url):
+# =====================================================================
+# ENDPOINTS — ADMIN
+# =====================================================================
+
+@app.route('/api/admin/users', methods=['GET'])
+@require_admin
+def admin_list_users():
     """
-    VULNERABILITY 15: Server-Side Request Forgery (SSRF)
-    CWE-918
+    CRITICAL — CWE-639: Auth bypass — role is from forged cookie
+    CRITICAL — CWE-200: Dumps passwords, SSNs, tokens
+    """
+    db = get_db()
+
+    # VULNERABLE: returns every column including plaintext passwords + SSNs
+    rows = db.execute("SELECT * FROM users").fetchall()
+
+    return jsonify([dict(row) for row in rows])
+
+
+@app.route('/api/admin/run-query', methods=['POST'])
+@require_admin
+def admin_run_query():
+    """
+    CRITICAL — CWE-89: Unrestricted SQL Execution
+
+    Arbitrary SQL from the client. Even if admin is "real", this is
+    an audit and PCI-DSS disaster.
+    """
+    sql = request.get_json().get('query')
+
+    logging.warning(f"Admin SQL execution: {sql}")
+
+    db = get_db()
+    try:
+        result = db.execute(sql).fetchall()  # VULNERABLE: arbitrary SQL
+        db.commit()
+        return jsonify([dict(r) for r in result])
+    except Exception as e:
+        return jsonify({'error': str(e), 'query': sql}), 500  # echoes query back
+
+
+@app.route('/api/admin/exec', methods=['POST'])
+@require_admin
+def admin_exec():
+    """
+    CRITICAL — CWE-78: OS Command Injection via admin endpoint
+
+    Even "admin-only" RCE endpoints are unacceptable in production.
+    """
+    cmd = request.get_json().get('command')
+
+    # VULNERABLE: arbitrary shell execution
+    import subprocess
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    return jsonify({
+        'stdout': result.stdout,
+        'stderr': result.stderr,
+        'returncode': result.returncode
+    })
+
+
+# =====================================================================
+# ENDPOINTS — FILE OPERATIONS
+# =====================================================================
+
+@app.route('/api/reports/download', methods=['GET'])
+@require_auth
+def download_report():
+    """
+    CRITICAL — CWE-22: Path Traversal
+    Attacker: ?filename=../../../../etc/shadow
+    """
+    filename = request.args.get('filename')
+
+    # VULNERABLE: no path validation
+    file_path = os.path.join('/var/reports', filename)
+
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'File not found'}), 404
+
+    return send_file(file_path)
+
+
+@app.route('/api/documents/upload', methods=['POST'])
+@require_auth
+def upload_document():
+    """
+    CRITICAL — CWE-434: Unrestricted File Upload
+    MAJOR   — CWE-400: No Size Limit
+    """
+    uploaded = request.files.get('file')
+
+    if not uploaded:
+        return jsonify({'error': 'No file'}), 400
+
+    # VULNERABLE: user-controlled filename, no type check, no size limit
+    save_path = os.path.join('/var/uploads', uploaded.filename)
+    uploaded.save(save_path)
+
+    # VULNERABLE: makes uploaded file publicly accessible
+    return jsonify({
+        'url': f"https://bank.com/uploads/{uploaded.filename}",
+        'path': save_path  # VULNERABLE: leaks server path
+    })
+
+
+@app.route('/api/documents/render', methods=['POST'])
+def render_document():
+    """
+    CRITICAL — CWE-1336: Server-Side Template Injection (SSTI)
+
+    User input fed into Jinja2 render_template_string — full RCE.
+    Exploit: {{ config.items() }} or {{ ''.__class__.__mro__[1].__subclasses__() }}
+    """
+    template_body = request.get_json().get('template', '')
+    variables = request.get_json().get('variables', {})
+
+    # VULNERABLE: SSTI — attacker controls the template string
+    rendered = render_template_string(template_body, **variables)
+
+    return rendered
+
+
+# =====================================================================
+# ENDPOINTS — INTEGRATIONS
+# =====================================================================
+
+@app.route('/api/integrations/webhook', methods=['POST'])
+def incoming_webhook():
+    """
+    CRITICAL — CWE-345: No Signature Verification on Webhook
+
+    Any internet host can POST fake payment events.
+    """
+    # VULNERABLE: no HMAC verification, no IP allowlist
+    payload = request.get_json()
+
+    logging.info(f"Webhook received: {json.dumps(payload)}")
+
+    db = get_db()
+
+    # VULNERABLE: trusts external payload for DB writes
+    if payload.get('event') == 'payment.completed':
+        db.execute(
+            f"UPDATE payments SET status = 'completed' WHERE id = {payload['payment_id']}"
+        )
+        db.commit()
+
+    return jsonify({'received': True})
+
+
+@app.route('/api/integrations/fetch-url', methods=['POST'])
+@require_auth
+def fetch_external_url():
+    """
+    CRITICAL — CWE-918: Server-Side Request Forgery (SSRF)
+
+    User-supplied URL is fetched from the server — enables reading
+    cloud metadata, internal services, etc.
     """
     import urllib.request
 
+    url = request.get_json().get('url')
+
+    # VULNERABLE: no allowlist, no scheme check, no internal-IP block
     try:
-        response = urllib.request.urlopen(receipt_url)
-        data = response.read()
-        return data
+        resp = urllib.request.urlopen(url)
+        body = resp.read().decode()
+        return jsonify({'status': resp.status, 'body': body})
     except Exception as e:
-        print(f"Download error: {e}")
-        return None
+        return jsonify({'error': str(e)}), 500
 
 
-def process_payment_batch(batch_file):
+@app.route('/api/integrations/notify', methods=['POST'])
+@require_auth
+def send_notification():
     """
-    VULNERABILITY 16: Race Condition (TOCTOU)
+    MAJOR — CWE-79: Reflected XSS via Email/SMS Template
+
+    User content injected into HTML template without escaping.
     """
-    if os.path.exists(batch_file):
-        with open(batch_file, 'r') as f:
-            data = f.read()
-        process_data(data)
+    data = request.get_json()
+    user_name = data.get('name', '')
+    message = data.get('message', '')
 
-
-def log_payment_transaction(transaction_data):
+    # VULNERABLE: user input in raw HTML — stored/reflected XSS
+    html_body = f"""
+    <html>
+    <body>
+        <h1>Hello {user_name}</h1>
+        <p>{message}</p>
+        <p>Sent by Payment Gateway on {datetime.now()}</p>
+    </body>
+    </html>
     """
-    VULNERABILITY 17: Log Injection
-    CWE-117
-    """
-    print(f"[INFO] Payment processed by user: {transaction_data['user']}")
-    print(f"[INFO] Amount: {transaction_data['amount']}")
-    print(f"[INFO] Account: {transaction_data['account']}")
 
-
-def parse_payment_xml(xml_file):
-    """
-    VULNERABILITY 9: XML External Entity (XXE) Attack
-    CWE-611
-    """
-    tree = ET.parse(xml_file)
-    root = tree.getroot()
-
-    payments = []
-    for payment in root.findall('payment'):
-        payments.append({
-            'id': payment.find('id').text,
-            'amount': payment.find('amount').text,
-            'account': payment.find('account').text
-        })
-    return payments
-
-
-def calculate_payment_hash(payment_data):
-    """
-    VULNERABILITY 18: Weak Cryptographic Hash (MD5)
-    CWE-327
-    """
-    payment_string = f"{payment_data['id']}{payment_data['amount']}{payment_data['account']}"
-    hash_value = hashlib.md5(payment_string.encode()).hexdigest()
-
-    return hash_value
-
-
-def connect_to_payment_api(endpoint):
-    """
-    VULNERABILITY 19: Disabled SSL Verification
-    CWE-295
-    """
-    import requests
-
-    response = requests.get(
-        f"https://api.bank.com/{endpoint}",
-        verify=False  # DANGEROUS!
-    )
-    return response.json()
+    # In production this would be emailed — here we just return it
+    return html_body, 200, {'Content-Type': 'text/html'}
 
 
 # =====================================================================
-# NEW CRITICAL & MAJOR VULNERABILITIES
+# ENDPOINTS — EXPORT / SERIALIZATION
 # =====================================================================
 
-
-def generate_auth_token(user_id):
+@app.route('/api/export/config', methods=['GET'])
+@require_admin
+def export_config():
     """
-    CRITICAL — VULNERABILITY 21: JWT None-Algorithm Attack
-    CWE-345 (Insufficient Verification of Data Authenticity)
+    CRITICAL — CWE-200: Credential Exposure via API
 
-    Accepts the 'none' algorithm, allowing an attacker to forge tokens
-    with no signature at all.
+    Returns every secret in a JSON blob.
     """
-    import jwt
+    # VULNERABLE: dumps all secrets to any "admin" (whose role comes from a cookie)
+    return jsonify({
+        'stripe_secret': STRIPE_SECRET,
+        'twilio_token': TWILIO_AUTH_TOKEN,
+        'sendgrid_key': SENDGRID_KEY,
+        'db_connection': DB_CONNECTION_STRING,
+        'master_api_key': MASTER_API_KEY,
+        'flask_secret': app.secret_key,
+        'aws_env': {
+            'access_key': os.environ.get('AWS_ACCESS_KEY_ID', ''),
+            'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+        }
+    })
 
-    payload = {
-        'user_id': user_id,
-        'role': 'user',
-        'exp': 9999999999
-    }
 
-    token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
-    return token
-
-
-def verify_auth_token(token):
+@app.route('/api/export/deserialize', methods=['POST'])
+@require_auth
+def deserialize_data():
     """
-    CRITICAL — Accepts 'none' algorithm, so forged unsigned tokens pass validation.
+    CRITICAL — CWE-502: Insecure Deserialization
+
+    Unpickles user-supplied base64 data — arbitrary code execution.
     """
-    import jwt
+    import pickle
 
-    # VULNERABLE: allows algorithm override from token header — attacker sets alg=none
-    decoded = jwt.decode(token, JWT_SECRET, algorithms=['HS256', 'none'])
-    return decoded
+    raw = request.get_json().get('data')
+
+    # VULNERABLE: pickle.loads on user-controlled input
+    obj = pickle.loads(base64.b64decode(raw))
+
+    return jsonify({'type': str(type(obj)), 'value': str(obj)})
 
 
-def store_user_credentials(username, password):
+@app.route('/api/export/yaml-import', methods=['POST'])
+@require_auth
+def yaml_import():
     """
-    CRITICAL — VULNERABILITY 22: Cleartext Password Storage
-    CWE-256
+    CRITICAL — CWE-502: Unsafe YAML Deserialization
 
-    Passwords stored in plaintext in the database.
+    yaml.load with FullLoader on user input.
     """
-    conn = mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    cursor = conn.cursor()
+    import yaml
 
-    # VULNERABLE: storing password as plaintext — no hashing at all
-    sql = f"INSERT INTO users (username, password) VALUES ('{username}', '{password}')"
-    cursor.execute(sql)  # Also SQL injection via username/password
+    raw_yaml = request.get_json().get('config')
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+    # VULNERABLE: FullLoader still allows some dangerous tags
+    config = yaml.load(raw_yaml, Loader=yaml.FullLoader)
 
-
-def generate_session_token():
-    """
-    CRITICAL — VULNERABILITY 23: Weak Randomness for Security Tokens
-    CWE-330
-
-    Uses Python's `random` module (Mersenne Twister, not cryptographically secure)
-    to generate session tokens. Predictable.
-    """
-    # VULNERABLE: random module is NOT cryptographically secure
-    token = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
-    return token
-
-
-def generate_password_reset_link(user_email):
-    """
-    CRITICAL — VULNERABILITY 24: Sensitive Data in URL / GET Parameters
-    CWE-598
-
-    Password-reset token placed in a GET URL that will appear in server
-    logs, browser history, Referer headers, and proxy caches.
-    """
-    import time
-
-    # VULNERABLE: predictable token (timestamp-based)
-    reset_token = hashlib.md5(f"{user_email}{time.time()}".encode()).hexdigest()
-
-    # VULNERABLE: sensitive token in URL query string
-    reset_link = f"https://bank.com/reset-password?email={user_email}&token={reset_token}"
-
-    print(f"Password reset link: {reset_link}")  # VULNERABLE: logging PII + token
-    return reset_link
-
-
-def upload_payment_proof(file_obj, filename):
-    """
-    CRITICAL — VULNERABILITY 25: Unrestricted File Upload
-    CWE-434
-
-    No validation of file type, size, or content.
-    Attacker can upload a web shell (.php, .jsp, .py).
-    """
-    # VULNERABLE: no file-type validation, no size limit, no content inspection
-    upload_dir = "/var/www/uploads/"
-
-    # VULNERABLE: using user-supplied filename directly (path traversal + overwrite)
-    dest_path = os.path.join(upload_dir, filename)
-
-    with open(dest_path, 'wb') as f:
-        f.write(file_obj.read())
-
-    # VULNERABLE: returning a publicly accessible URL to the uploaded file
-    return f"https://bank.com/uploads/{filename}"
-
-
-def authenticate_user(username, password):
-    """
-    CRITICAL — VULNERABILITY 26: Missing Rate Limiting / Brute-Force Protection
-    CWE-307
-
-    No lockout, no delay, no CAPTCHA — unlimited login attempts.
-    """
-    conn = mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    cursor = conn.cursor()
-
-    # VULNERABLE: SQL injection AND no rate limiting
-    sql = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
-    cursor.execute(sql)
-
-    user = cursor.fetchone()
-    cursor.close()
-    conn.close()
-
-    if user:
-        # VULNERABLE: session token via weak random
-        return {'authenticated': True, 'session': generate_session_token()}
-    else:
-        # VULNERABLE: user enumeration — different messages for bad user vs bad password
-        return {'authenticated': False, 'error': 'Invalid password for this account'}
-
-
-def encrypt_payment_data(plaintext):
-    """
-    CRITICAL — VULNERABILITY 27: Hardcoded Key + ECB Mode
-    CWE-327 / CWE-798
-
-    AES-ECB leaks data patterns; the key is hardcoded in source.
-    """
-    from Crypto.Cipher import AES
-
-    # VULNERABLE: ECB mode leaks patterns in ciphertext
-    cipher = AES.new(ENCRYPTION_KEY, AES.MODE_ECB)
-
-    # VULNERABLE: naive PKCS-style padding
-    padded = plaintext.encode().ljust((len(plaintext) // 16 + 1) * 16, b'\0')
-    encrypted = cipher.encrypt(padded)
-
-    return encrypted
-
-
-def process_webhook_payload(raw_body):
-    """
-    CRITICAL — VULNERABILITY 28: Arbitrary Code Execution via exec()
-    CWE-94
-
-    Runs user-supplied code from a webhook body.
-    """
-    payload = json.loads(raw_body)
-
-    # VULNERABLE: exec() on user-controlled string
-    if 'transform' in payload:
-        exec(payload['transform'])  # Attacker sends arbitrary Python
-
-    return payload.get('data', {})
-
-
-def update_user_profile(user_id, update_data):
-    """
-    MAJOR — VULNERABILITY 29: Mass Assignment / Object Injection
-    CWE-915
-
-    Accepts arbitrary fields from client — attacker can set
-    `role`, `is_admin`, `balance`, etc.
-    """
-    conn = mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    cursor = conn.cursor()
-
-    # VULNERABLE: blindly iterates over all user-supplied keys
-    for key, value in update_data.items():
-        sql = f"UPDATE users SET {key} = '{value}' WHERE id = {user_id}"
-        cursor.execute(sql)
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-
-def redirect_after_payment(return_url):
-    """
-    MAJOR — VULNERABILITY 30: Unvalidated Redirect
-    CWE-601
-
-    Attacker controls the redirect target — enables phishing.
-    """
-    from flask import redirect
-
-    # VULNERABLE: no allowlist check on return_url
-    # Exploit: return_url = "https://evil-bank.com/steal-creds"
-    return redirect(return_url)
-
-
-def validate_transaction_reference(ref):
-    """
-    MAJOR — VULNERABILITY 31: ReDoS (Regular Expression Denial of Service)
-    CWE-1333
-
-    Catastrophic backtracking on crafted input.
-    """
-    # VULNERABLE: nested quantifiers cause exponential backtracking
-    pattern = r'^([a-zA-Z0-9]+)+\-[a-zA-Z0-9]+$'
-
-    if re.match(pattern, ref):
-        return True
-    return False
-
-
-def get_payment_details(payment_id, requesting_user):
-    """
-    MAJOR — VULNERABILITY 32: Broken Access Control / IDOR
-    CWE-639
-
-    Any authenticated user can view any payment — no ownership check.
-    """
-    conn = mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    cursor = conn.cursor()
-
-    # VULNERABLE: no check that requesting_user owns this payment_id
-    sql = f"SELECT * FROM payments WHERE id = {payment_id}"
-    cursor.execute(sql)
-
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
-
-    return result
-
-
-def create_temp_payment_file(data):
-    """
-    MAJOR — VULNERABILITY 33: Insecure Temp File Creation
-    CWE-377
-
-    Predictable filename in world-readable /tmp — symlink attacks possible.
-    """
-    # VULNERABLE: predictable filename, default permissions
-    tmp_path = f"/tmp/payment_{os.getpid()}.json"
-
-    with open(tmp_path, 'w') as f:
-        json.dump(data, f)  # may contain PII, card numbers, etc.
-
-    return tmp_path
-
-
-def deep_merge(base, overrides):
-    """
-    MAJOR — VULNERABILITY 34: Prototype Pollution via Recursive Merge
-    CWE-1321
-
-    Attacker-controlled keys like __class__, __init__, __globals__
-    can poison internal object state.
-    """
-    for key, value in overrides.items():
-        # VULNERABLE: no key filtering — allows dunder / prototype keys
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            deep_merge(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
-def error_handler(request_data):
-    """
-    MAJOR — VULNERABILITY 35: Debug / Stack Trace Exposure in Production
-    CWE-209 / CWE-215
-    """
-    try:
-        result = process_complex_payment(request_data)
-        return result
-    except Exception as e:
-        if DEBUG_MODE:
-            import traceback
-            # VULNERABLE: full stack trace + local variable dump returned to client
-            error_detail = {
-                'error': str(e),
-                'traceback': traceback.format_exc(),
-                'request_data': request_data,  # echoes back PII
-                'db_host': DB_HOST,
-                'db_user': DB_USER,
-                'db_password': DB_PASSWORD,  # leaks credentials in error response!
-                'environment': dict(os.environ)  # leaks ALL env vars
-            }
-            return error_detail
-
-
-def validate_payment_amount(amount_str):
-    """
-    MAJOR — VULNERABILITY 36: Integer Overflow in Payment Amount
-    CWE-190
-
-    No upper-bound validation — attacker can overflow or cause
-    negative-wrap amounts.
-    """
-    # VULNERABLE: no bounds check, no type enforcement
-    amount = int(amount_str)
-
-    # Negative amounts could trigger refunds to attacker
-    if amount == 0:
-        raise ValueError("Amount cannot be zero")
-
-    # No upper-bound — 99999999999999 could overflow downstream int32 fields
-    return amount
-
-
-def fetch_user_payments(user_id):
-    """
-    MAJOR — VULNERABILITY 37: GraphQL-style Over-fetching / Info Disclosure
-    Returns all columns including PII to any caller.
-    """
-    conn = mysql.connector.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    cursor = conn.cursor(dictionary=True)
-
-    # VULNERABLE: SELECT * exposes SSN, full card number, CVV, etc.
-    cursor.execute(f"SELECT * FROM payments WHERE user_id = {user_id}")
-    rows = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-
-    # VULNERABLE: dumps all fields to client — no field filtering
-    return json.dumps(rows)
+    return jsonify({'parsed': str(config)})
 
 
 # =====================================================================
-# MAIN
+# MIDDLEWARE / ERROR HANDLERS
 # =====================================================================
 
-def main():
+@app.before_request
+def log_request():
     """
-    Main function with multiple vulnerabilities
+    MAJOR — CWE-532: Sensitive Data in Logs
+
+    Logs full request body including passwords, card numbers, tokens.
     """
-    if len(sys.argv) < 2:
-        print("Usage: python data_processor.py <command> [args]")
-        sys.exit(1)
-
-    command = sys.argv[1]
-
-    # VULNERABILITY 20: Unrestricted Command Execution
-    if command == "process":
-        filename = sys.argv[2] if len(sys.argv) > 2 else "default.csv"
-        process_payment_file(filename)
-
-    elif command == "export":
-        output = sys.argv[2] if len(sys.argv) > 2 else "export.csv"
-        query = sys.argv[3] if len(sys.argv) > 3 else "status='PENDING'"
-        export_payments_to_csv(output, query)
-
-    elif command == "report":
-        report_type = sys.argv[2] if len(sys.argv) > 2 else "daily"
-        params = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ""
-        generate_report(report_type, params)
-
-    elif command == "backup":
-        bucket = sys.argv[2] if len(sys.argv) > 2 else "bank-backups"
-        file_path = sys.argv[3] if len(sys.argv) > 3 else "/data/backup.sql"
-        backup_to_s3(bucket, file_path)
-
-    else:
-        print(f"Unknown command: {command}")
+    logging.debug(f"REQUEST {request.method} {request.path} body={request.get_data(as_text=True)}")
+    logging.debug(f"Headers: {dict(request.headers)}")  # VULNERABLE: logs auth headers
 
 
-if __name__ == "__main__":
-    main()
+@app.after_request
+def add_headers(response):
+    """
+    MAJOR — CWE-693: Missing Security Headers
+
+    No CSP, no X-Frame-Options, no HSTS, no X-Content-Type-Options.
+    """
+    # VULNERABLE: CORS wildcard
+    response.headers['Access-Control-Allow-Origin'] = ALLOWED_ORIGINS
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = '*'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'  # VULNERABLE with wildcard origin
+
+    # VULNERABLE: all protective headers are MISSING
+    # Should have: Content-Security-Policy, X-Frame-Options, Strict-Transport-Security,
+    #              X-Content-Type-Options, Referrer-Policy, Permissions-Policy
+
+    return response
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    """
+    MAJOR — CWE-209: Error Info Disclosure
+
+    Returns full traceback and environment to the client.
+    """
+    import traceback
+
+    return jsonify({
+        'error': str(error),
+        'traceback': traceback.format_exc(),
+        'environment': {k: v for k, v in os.environ.items()},
+        'config': {k: str(v) for k, v in app.config.items()}
+    }), 500
 
 
 # =====================================================================
-# SECURE REFERENCE IMPLEMENTATIONS (for comparison)
+# BACKGROUND JOBS (simulated)
 # =====================================================================
 
-def secure_command_execution(filename):
-    """SECURE: Using parameterized command execution"""
-    import shlex
+def nightly_report_job():
+    """
+    MAJOR — CWE-377: Insecure Temp File
+    MAJOR — CWE-732: Incorrect Permission Assignment
+    """
+    report_path = f"/tmp/nightly_report_{datetime.now().strftime('%Y%m%d')}.csv"
 
-    if not filename.endswith('.csv'):
-        raise ValueError("Invalid file type")
+    db = sqlite3.connect('/var/data/payments.db')
 
-    result = subprocess.run(
-        ['wc', '-l', f'/data/payments/{filename}'],
-        capture_output=True,
-        text=True
+    # VULNERABLE: SELECT * includes card numbers, CVVs
+    rows = db.execute("SELECT * FROM payments WHERE status = 'completed'").fetchall()
+
+    # VULNERABLE: world-readable temp file with PII
+    with open(report_path, 'w') as f:
+        for row in rows:
+            f.write(','.join(str(col) for col in row) + '\n')
+
+    # VULNERABLE: file persists in /tmp indefinitely
+    os.chmod(report_path, 0o777)  # world-readable + writable + executable
+
+    logging.info(f"Nightly report written to {report_path}")
+
+
+def purge_old_data():
+    """
+    CRITICAL — CWE-78: Command Injection in Scheduled Job
+
+    Cron-like job that builds a shell command from a config value.
+    """
+    # Imagine retention_days comes from a YAML config an attacker can edit
+    retention_days = os.environ.get('RETENTION_DAYS', '90')
+
+    # VULNERABLE: unsanitized env var in shell command
+    os.system(f"find /var/data/archives -mtime +{retention_days} -delete")
+
+
+# =====================================================================
+# STARTUP
+# =====================================================================
+
+if __name__ == '__main__':
+    # CRITICAL — CWE-668: Binding to all interfaces in production
+    # CRITICAL — CWE-489: Debug mode active
+    app.run(
+        host='0.0.0.0',  # VULNERABLE: listens on all interfaces
+        port=8080,
+        debug=True,       # VULNERABLE: Werkzeug debugger exposed
+        use_reloader=True
     )
-    return result.stdout
-
-
-def secure_sql_query(query_filter):
-    """SECURE: Using parameterized queries"""
-    conn = mysql.connector.connect(
-        host=os.environ.get('DB_HOST'),
-        user=os.environ.get('DB_USER'),
-        password=os.environ.get('DB_PASSWORD'),
-        database=os.environ.get('DB_NAME')
-    )
-    cursor = conn.cursor()
-
-    sql = "SELECT * FROM payments WHERE status = %s AND amount > %s"
-    cursor.execute(sql, (query_filter['status'], query_filter['amount']))
-
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return results
-
-
-def secure_file_write(output_file, data):
-    """SECURE: Validate path and use safe directory"""
-    import pathlib
-
-    safe_dir = pathlib.Path('/var/exports/')
-    output_path = (safe_dir / output_file).resolve()
-
-    if not str(output_path).startswith(str(safe_dir)):
-        raise ValueError("Invalid output path")
-
-    with open(output_path, 'w') as f:
-        f.write(data)
