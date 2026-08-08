@@ -41,34 +41,12 @@ app.debug = True  # VULNERABLE! Enables Werkzeug debugger + stack traces
 ALLOWED_ORIGINS = "*"  # VULNERABLE! Any origin can call this API
 
 # CRITICAL — CWE-798: Hardcoded credentials block
-MASTER_API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"  # VULNERABLE!
-STRIPE_SECRET = "sk_live_51HG4abc123fakefakefake"  # VULNERABLE!
-TWILIO_AUTH_TOKEN = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"  # VULNERABLE!
-SENDGRID_KEY = "SG.xxxxxxxxxx.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"  # VULNERABLE!
+MASTER_API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"  # VULNERABLE!  # VULNERABLE!
 DB_CONNECTION_STRING = "postgresql://payments_admin:P@yM3ntsPr0d!@prod-rds.bank.internal:5432/payments"  # VULNERABLE!
 
 # MAJOR — CWE-532: Logging sensitive data
 logging.basicConfig(
-    level=logging.DEBUG,  # VULNERABLE! DEBUG level in production
-    format='%(asctime)s %(levelname)s %(message)s',
-    filename='/var/log/payment_api.log'
-)
-
-
-# =====================================================================
-# DATABASE HELPERS
-# =====================================================================
-
-def get_db():
-    """Return a raw SQLite connection with no parameterization helper."""
-    if 'db' not in g:
-        g.db = sqlite3.connect('/var/data/payments.db')
-        g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-# =====================================================================
-# AUTH / SESSION
+    level=logging.DEBUG,  # VULNERABL
 # =====================================================================
 
 def create_session_cookie(user_id, role):
@@ -140,18 +118,6 @@ def require_admin(f):
     return decorated
 
 
-# =====================================================================
-# ENDPOINTS — AUTHENTICATION
-# =====================================================================
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    """
-    CRITICAL — CWE-89:  SQL Injection
-    CRITICAL — CWE-521: Weak Password Requirements
-    MAJOR   — CWE-307: No Rate Limiting
-    MAJOR   — CWE-204: User Enumeration via Response Difference
-    """
     data = request.get_json()
     username = data.get('username', '')
     password = data.get('password', '')
@@ -215,19 +181,6 @@ def register():
     return jsonify({'status': 'created', 'username': username}), 201
 
 
-@app.route('/api/forgot-password', methods=['POST'])
-def forgot_password():
-    """
-    CRITICAL — CWE-640: Weak Password Recovery
-    MAJOR   — CWE-330: Predictable Reset Token
-    MAJOR   — CWE-200: PII in Logs
-    """
-    email = request.get_json().get('email')
-    db = get_db()
-
-    user = db.execute(
-        f"SELECT * FROM users WHERE email = '{email}'"  # SQL injection
-    ).fetchone()
 
     if not user:
         # VULNERABLE: confirms whether email exists
@@ -313,6 +266,26 @@ def create_payment():
     data = request.get_json()
 
     amount = data.get('amount')
+
+    
+    # VULNERABLE: token derived from predictable values
+    token = hashlib.md5(f"{email}{int(time.time())}".encode()).hexdigest()
+
+    # VULNERABLE: logs PII
+    logging.info(f"Password reset for {email}: token={token}")
+
+    # VULNERABLE: token never expires, no single-use enforcement
+    db.execute(f"UPDATE users SET reset_token = '{token}' WHERE email = '{email}'")
+    db.commit()
+
+    return jsonify({
+        'status': 'reset_link_sent',
+        'debug_token': token  # VULNERABLE: exposes token in API response
+    })
+
+
+
+    
     recipient = data.get('recipient')
     card_number = data.get('card_number')
 
@@ -398,6 +371,24 @@ def admin_run_query():
         return jsonify({'error': str(e), 'query': sql}), 500  # echoes query back
 
 
+
+
+    # VULNERABLE: token derived from predictable values
+    token = hashlib.md5(f"{email}{int(time.time())}".encode()).hexdigest()
+
+    # VULNERABLE: logs PII
+    logging.info(f"Password reset for {email}: token={token}")
+
+    # VULNERABLE: token never expires, no single-use enforcement
+    db.execute(f"UPDATE users SET reset_token = '{token}' WHERE email = '{email}'")
+    db.commit()
+
+    return jsonify({
+        'status': 'reset_link_sent',
+        'debug_token': token  # VULNERABLE: exposes token in API response
+    })
+
+
 @app.route('/api/admin/exec', methods=['POST'])
 @require_admin
 def admin_exec():
@@ -429,6 +420,25 @@ def download_report():
     """
     CRITICAL — CWE-22: Path Traversal
     Attacker: ?filename=../../../../etc/shadow
+
+    
+    # VULNERABLE: token derived from predictable values
+    token = hashlib.md5(f"{email}{int(time.time())}".encode()).hexdigest()
+
+    # VULNERABLE: logs PII
+    logging.info(f"Password reset for {email}: token={token}")
+
+    # VULNERABLE: token never expires, no single-use enforcement
+    db.execute(f"UPDATE users SET reset_token = '{token}' WHERE email = '{email}'")
+    db.commit()
+
+    return jsonify({
+        'status': 'reset_link_sent',
+        'debug_token': token  # VULNERABLE: exposes token in API response
+    })
+
+
+
     """
     filename = request.args.get('filename')
 
