@@ -1,485 +1,394 @@
 """
-ADDITIONAL INTENTIONALLY VULNERABLE ENDPOINTS — paste into the demo file.
-Covers: XXE, Open Redirect, JWT 'none' alg, Race Condition, Mass Assignment,
-ReDoS, Weak Crypto, Insecure Randomness, CRLF Injection, LDAP Injection,
-Broken Rate Limiting, Prototype Pollution (via merge), Timing Attack on API keys.
+ADDITIONAL DEMO ENDPOINTS — PART 2
+Covers categories underrepresented in part 1: Performance & Scalability,
+Stability & Availability, Functional Correctness, Data Integrity &
+Integration, and Maintainability & Code Quality.
+
+These are intentionally flawed, for exercising automated code review
+(e.g. CodeRabbit) against a broad rule set. Do not deploy.
 """
 
-import hashlib
-import random
-import string
-import xml.etree.ElementTree as ET
-from datetime import datetime
+import json
+import os
+import threading
+import requests  # NOTE: add to requirements if not already present
 
 
 # =====================================================================
-# VULNERABILITY: CWE-611 — XML External Entity (XXE)
+# PERFORMANCE: N+1 Query Pattern
 # =====================================================================
 
-@app.route('/api/payments/import-xml', methods=['POST'])
+@app.route('/api/orders/list-with-items', methods=['GET'])
 @require_auth
-def import_payments_xml():
+def list_orders_with_items():
     """
-    CRITICAL — CWE-611: XML External Entity Injection
-
-    Parses user-supplied XML with external entity resolution enabled.
-    Exploit payload:
-      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
-      <payment><amount>&xxe;</amount></payment>
-    """
-    from lxml import etree
-
-    raw_xml = request.data
-
-    # VULNERABLE: resolves external entities — reads local files, SSRF
-    parser = etree.XMLParser(resolve_entities=True, no_network=False)
-    tree = etree.fromstring(raw_xml, parser=parser)
-
-    amount = tree.findtext('amount')
-    recipient = tree.findtext('recipient')
-
-    db = get_db()
-    db.execute(
-        f"INSERT INTO payments (user_id, amount, recipient, status) "
-        f"VALUES ({g.current_user['user_id']}, '{amount}', '{recipient}', 'pending')"
-    )
-    db.commit()
-
-    return jsonify({'status': 'imported', 'amount': amount})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-601 — Open Redirect
-# =====================================================================
-
-@app.route('/api/auth/callback', methods=['GET'])
-def oauth_callback():
-    """
-    CRITICAL — CWE-601: Open Redirect
-
-    The 'redirect_uri' parameter is not validated against an allowlist.
-    Attacker: /api/auth/callback?redirect_uri=https://evil.com/steal-token
-    """
-    code = request.args.get('code', '')
-    redirect_uri = request.args.get('redirect_uri', '/')
-
-    # VULNERABLE: no validation — attacker controls the redirect destination
-    # Could be used to steal OAuth tokens via a malicious redirect
-    return redirect(redirect_uri + f"?code={code}")
-
-
-# =====================================================================
-# VULNERABILITY: CWE-347 — JWT 'none' Algorithm Bypass
-# =====================================================================
-
-@app.route('/api/auth/verify-token', methods=['POST'])
-def verify_jwt():
-    """
-    CRITICAL — CWE-347: Improper Verification of Cryptographic Signature
-
-    Accepts JWTs with alg='none', bypassing signature verification.
-    """
-    import jwt as pyjwt
-
-    token = request.get_json().get('token', '')
-
-    # VULNERABLE: algorithms list includes 'none' — attacker forges any claim
-    try:
-        payload = pyjwt.decode(
-            token,
-            'jwt-secret-key-2024',
-            algorithms=['HS256', 'none']  # VULNERABLE!
-        )
-        return jsonify({'valid': True, 'claims': payload})
-    except Exception as e:
-        return jsonify({'valid': False, 'error': str(e)}), 401
-
-
-# =====================================================================
-# VULNERABILITY: CWE-367 — Race Condition (TOCTOU) on Balance
-# =====================================================================
-
-@app.route('/api/wallet/withdraw', methods=['POST'])
-@require_auth
-def withdraw():
-    """
-    CRITICAL — CWE-367: Time-of-Check to Time-of-Use Race Condition
-
-    No locking — two concurrent requests can both pass the balance
-    check and withdraw, draining the account below zero.
-    """
-    data = request.get_json()
-    amount = float(data.get('amount', 0))
-    user_id = g.current_user['user_id']
-
-    db = get_db()
-
-    # VULNERABLE: check and update are separate — no SELECT ... FOR UPDATE, no lock
-    balance = db.execute(
-        f"SELECT balance FROM wallets WHERE user_id = {user_id}"
-    ).fetchone()
-
-    if balance and balance['balance'] >= amount:
-        # Another request can pass the check above before this UPDATE runs
-        time.sleep(0.1)  # simulates processing delay that widens the race window
-
-        db.execute(
-            f"UPDATE wallets SET balance = balance - {amount} WHERE user_id = {user_id}"
-        )
-        db.commit()
-        return jsonify({'status': 'withdrawn', 'amount': amount})
-
-    return jsonify({'error': 'Insufficient funds'}), 400
-
-
-# =====================================================================
-# VULNERABILITY: CWE-915 — Mass Assignment
-# =====================================================================
-
-@app.route('/api/profile/update', methods=['PUT'])
-@require_auth
-def update_profile():
-    """
-    CRITICAL — CWE-915: Improperly Controlled Modification of
-                         Dynamically-Determined Object Attributes
-
-    Client can send ANY column name and it gets written to the DB.
-    Exploit: {"role": "admin", "credit_limit": 999999}
-    """
-    data = request.get_json()
-    user_id = g.current_user['user_id']
-
-    db = get_db()
-
-    # VULNERABLE: iterates ALL client-supplied keys — no allowlist
-    for key, value in data.items():
-        db.execute(
-            f"UPDATE users SET {key} = '{value}' WHERE id = {user_id}"  # also SQL injection
-        )
-
-    db.commit()
-
-    return jsonify({'status': 'profile_updated', 'fields': list(data.keys())})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-1333 — ReDoS (Regular Expression DoS)
-# =====================================================================
-
-@app.route('/api/validate/email', methods=['POST'])
-def validate_email():
-    """
-    MAJOR — CWE-1333: Inefficient Regular Expression Complexity
-
-    Catastrophic backtracking on crafted input.
-    Exploit: "a" * 30 + "!"
-    """
-    email = request.get_json().get('email', '')
-
-    # VULNERABLE: evil regex — exponential backtracking on non-matching input
-    pattern = r'^([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+@([a-zA-Z0-9]+\.)*[a-zA-Z0-9]+$'
-
-    if re.match(pattern, email):
-        return jsonify({'valid': True})
-    else:
-        return jsonify({'valid': False})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-327 / CWE-328 — Weak Cryptography
-# =====================================================================
-
-@app.route('/api/payments/sign', methods=['POST'])
-@require_auth
-def sign_payment():
-    """
-    CRITICAL — CWE-327: Use of a Broken Cryptographic Algorithm
-    CRITICAL — CWE-798: Hardcoded Signing Key
-
-    Uses MD5 for payment integrity — trivially forgeable.
-    """
-    data = request.get_json()
-
-    payment_string = f"{data['amount']}|{data['recipient']}|{data['currency']}"
-
-    # VULNERABLE: MD5 is broken for integrity; key is hardcoded
-    signing_key = "payment-signing-key-2024"
-    signature = hashlib.md5(
-        (signing_key + payment_string).encode()
-    ).hexdigest()
-
-    return jsonify({
-        'payment_data': payment_string,
-        'signature': signature,
-        'algorithm': 'md5'  # VULNERABLE: reveals algorithm to attacker
-    })
-
-
-# =====================================================================
-# VULNERABILITY: CWE-330 — Insecure Randomness for Security Tokens
-# =====================================================================
-
-@app.route('/api/auth/generate-api-key', methods=['POST'])
-@require_auth
-def generate_api_key():
-    """
-    CRITICAL — CWE-330: Use of Insufficiently Random Values
-
-    API keys generated with Python's `random` module (Mersenne Twister)
-    which is predictable — not cryptographically secure.
-    """
-    # VULNERABLE: random.choice is NOT cryptographically secure
-    charset = string.ascii_letters + string.digits
-    api_key = 'sk_' + ''.join(random.choice(charset) for _ in range(32))
-
-    db = get_db()
-    db.execute(
-        f"UPDATE users SET api_key = '{api_key}' WHERE id = {g.current_user['user_id']}"
-    )
-    db.commit()
-
-    return jsonify({'api_key': api_key})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-113 — HTTP Response Splitting / CRLF Injection
-# =====================================================================
-
-@app.route('/api/locale/set', methods=['GET'])
-def set_locale():
-    """
-    MAJOR — CWE-113: Improper Neutralization of CRLF in HTTP Headers
-
-    User input injected into a response header without sanitization.
-    Exploit: ?lang=en%0d%0aSet-Cookie:%20admin=true
-    """
-    lang = request.args.get('lang', 'en')
-
-    resp = make_response(jsonify({'locale': lang}))
-
-    # VULNERABLE: raw user input in header value — enables header injection
-    resp.headers['Content-Language'] = lang
-
-    return resp
-
-
-# =====================================================================
-# VULNERABILITY: CWE-90 — LDAP Injection
-# =====================================================================
-
-@app.route('/api/directory/search', methods=['GET'])
-@require_auth
-def ldap_search():
-    """
-    CRITICAL — CWE-90: LDAP Injection
-
-    User input placed directly into an LDAP filter string.
-    Exploit: ?name=*)(uid=*))(|(uid=*
-    """
-    name = request.args.get('name', '')
-
-    # VULNERABLE: no escaping of LDAP special characters
-    ldap_filter = f"(&(objectClass=person)(cn={name}))"
-
-    # Simulated — in real code this would call ldap.search_s()
-    logging.info(f"LDAP query: {ldap_filter}")
-
-    return jsonify({
-        'filter_used': ldap_filter,  # VULNERABLE: exposes internal query
-        'results': []
-    })
-
-
-# =====================================================================
-# VULNERABILITY: CWE-770 — Missing Rate Limiting
-# =====================================================================
-
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    """
-    CRITICAL — CWE-770: Allocation of Resources Without Limits
-
-    No rate limiting on OTP verification — attacker can brute-force
-    all 6-digit codes (1,000,000 attempts) in minutes.
-    """
-    data = request.get_json()
-    user_id = data.get('user_id')
-    otp = data.get('otp')
-
-    db = get_db()
-
-    stored = db.execute(
-        f"SELECT otp_code FROM pending_otp WHERE user_id = {user_id}"  # SQL injection too
-    ).fetchone()
-
-    # VULNERABLE: no attempt counter, no lockout, no delay
-    if stored and stored['otp_code'] == otp:
-        return jsonify({'status': 'verified'})
-
-    # VULNERABLE: reveals whether the OTP was wrong vs user doesn't exist
-    if not stored:
-        return jsonify({'error': 'No pending OTP for this user'}), 404
-
-    return jsonify({'error': 'Invalid OTP'}), 401
-
-
-# =====================================================================
-# VULNERABILITY: CWE-208 — Timing Attack on API Key Comparison
-# =====================================================================
-
-@app.route('/api/partner/authenticate', methods=['POST'])
-def partner_authenticate():
-    """
-    MAJOR — CWE-208: Observable Timing Discrepancy
-
-    String comparison with == leaks key length and content via timing
-    side-channel. Should use hmac.compare_digest().
-    """
-    provided_key = request.get_json().get('api_key', '')
-
-    # VULNERABLE: early-exit string comparison — timing oracle
-    if provided_key == MASTER_API_KEY:
-        return jsonify({'status': 'authenticated', 'access': 'full'})
-
-    return jsonify({'error': 'Invalid API key'}), 403
-
-
-# =====================================================================
-# VULNERABILITY: CWE-1321 — Prototype-Pollution-style Deep Merge
-# =====================================================================
-
-@app.route('/api/settings/merge', methods=['POST'])
-@require_auth
-def merge_settings():
-    """
-    CRITICAL — CWE-1321: Improperly Controlled Modification of
-                          Object Prototype Attributes (Python analogue)
-
-    Recursive merge of user input into a global config dict.
-    Attacker can overwrite any nested key including __class__, __init__, etc.
-    """
-    user_input = request.get_json()
-
-    def deep_merge(base, override):
-        """VULNERABLE: no key filtering — can overwrite anything."""
-        for key, value in override.items():
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                deep_merge(base[key], value)
-            else:
-                base[key] = value  # VULNERABLE: unrestricted key write
-        return base
-
-    # VULNERABLE: mutates global app config from user input
-    deep_merge(app.config, user_input)
-
-    return jsonify({'status': 'settings_updated'})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-863 — Horizontal Privilege Escalation via
-#                            Enumerable Account Numbers
-# =====================================================================
-
-@app.route('/api/accounts/<account_number>/statement', methods=['GET'])
-@require_auth
-def get_statement(account_number):
-    """
-    CRITICAL — CWE-863: Incorrect Authorization
-    MAJOR   — CWE-200: Exposure of Sensitive Information
-
-    Account numbers are sequential integers — trivially enumerable.
-    No ownership check: any authenticated user reads any statement.
+    PERFORMANCE — N+1 Query Problem
+
+    Fetches all orders, then issues one additional query PER order to
+    fetch its line items, instead of a single JOIN or batched IN query.
+    With 1,000 orders this is 1,001 round trips to the DB.
     """
     db = get_db()
-
-    # VULNERABLE: no check that account_number belongs to the current user
-    rows = db.execute(
-        f"SELECT * FROM transactions WHERE account_number = '{account_number}'"  # SQLi
+    orders = db.execute(
+        f"SELECT * FROM orders WHERE user_id = {g.current_user['user_id']}"
     ).fetchall()
 
-    # VULNERABLE: returns full PAN, routing number, SSN in each row
+    result = []
+    for order in orders:
+        # PERFORMANCE: one query per row inside the loop
+        items = db.execute(
+            f"SELECT * FROM order_items WHERE order_id = {order['id']}"
+        ).fetchall()
+        result.append({'order': dict(order), 'items': [dict(i) for i in items]})
+
+    return jsonify(result)
+
+
+# =====================================================================
+# PERFORMANCE: Missing Caching on Expensive/Repeated Computation
+# =====================================================================
+
+@app.route('/api/reports/monthly-summary', methods=['GET'])
+@require_auth
+def monthly_summary():
+    """
+    PERFORMANCE — Missing Caching
+
+    Recomputes an expensive aggregate on every single request, even
+    though the underlying data (last month's closed transactions)
+    never changes after month-end. No cache layer, no memoization.
+    """
+    db = get_db()
+    month = request.args.get('month')
+
+    # PERFORMANCE: full table scan + aggregation on every call, no cache
+    rows = db.execute(
+        f"SELECT * FROM transactions WHERE month = '{month}' AND status = 'closed'"
+    ).fetchall()
+
+    total = 0
+    by_category = {}
+    for r in rows:
+        total += r['amount']
+        by_category.setdefault(r['category'], 0)
+        by_category[r['category']] += r['amount']
+
+    return jsonify({'total': total, 'by_category': by_category})
+
+
+# =====================================================================
+# PERFORMANCE: Unbounded / Unpaginated List Endpoint
+# =====================================================================
+
+@app.route('/api/transactions/all', methods=['GET'])
+@require_auth
+def all_transactions():
+    """
+    PERFORMANCE — Unbounded Result Set
+
+    No LIMIT/OFFSET or pagination. On an account with millions of
+    transactions this loads the entire table into memory and serializes
+    it in one response.
+    """
+    db = get_db()
+    rows = db.execute("SELECT * FROM transactions").fetchall()  # no LIMIT
+    return jsonify([dict(r) for r in rows])
+
+
+# =====================================================================
+# STABILITY: Unbounded In-Memory Cache (Memory Leak)
+# =====================================================================
+
+_SESSION_CACHE = {}  # module-level dict, never evicted or size-capped
+
+
+@app.route('/api/session/touch', methods=['POST'])
+@require_auth
+def touch_session():
+    """
+    STABILITY — Memory Leak via Unbounded Cache Growth
+
+    Every call adds an entry to a process-global dict that is never
+    cleaned up or size-limited. Over the process lifetime this grows
+    without bound and will eventually exhaust available memory.
+    """
+    session_id = request.get_json().get('session_id')
+
+    # STABILITY: no eviction policy, no max size, no TTL
+    _SESSION_CACHE[session_id] = {
+        'user_id': g.current_user['user_id'],
+        'last_seen': datetime.utcnow(),
+        'payload': request.get_json(),  # also retains full request body forever
+    }
+
+    return jsonify({'status': 'ok', 'cache_size': len(_SESSION_CACHE)})
+
+
+# =====================================================================
+# STABILITY: Unhandled Exception on External Call (No Timeout, No Catch)
+# =====================================================================
+
+@app.route('/api/shipping/rate-quote', methods=['POST'])
+@require_auth
+def rate_quote():
+    """
+    STABILITY — Unhandled Exception / No Timeout
+
+    Calls an external carrier API with no timeout and no exception
+    handling. A slow or unreachable upstream service will hang the
+    worker thread indefinitely and an HTTP error or malformed JSON
+    response will crash this request with an unhandled exception.
+    """
+    data = request.get_json()
+
+    # STABILITY: no timeout= kwarg, no try/except around network I/O
+    response = requests.post(
+        "https://carrier.example.com/v1/quote",
+        json={'weight': data['weight'], 'destination': data['destination']},
+    )
+
+    # STABILITY: assumes response is always 200 with this exact shape
+    quote = response.json()['quote']['amount']
+
+    return jsonify({'quote': quote})
+
+
+# =====================================================================
+# STABILITY: Deadlock-Prone Lock Ordering
+# =====================================================================
+
+_lock_a = threading.Lock()
+_lock_b = threading.Lock()
+
+
+@app.route('/api/transfer/internal', methods=['POST'])
+@require_auth
+def internal_transfer():
+    """
+    STABILITY — Inconsistent Lock Ordering (Deadlock Risk)
+
+    Acquires _lock_a then _lock_b. Another code path elsewhere in the
+    service (not shown) acquires _lock_b then _lock_a. Under concurrent
+    load these two orderings can deadlock the process.
+    """
+    data = request.get_json()
+
+    with _lock_a:
+        with _lock_b:  # STABILITY: opposite acquisition order used elsewhere
+            db = get_db()
+            db.execute(
+                f"UPDATE wallets SET balance = balance - {data['amount']} "
+                f"WHERE user_id = {data['from_id']}"
+            )
+            db.execute(
+                f"UPDATE wallets SET balance = balance + {data['amount']} "
+                f"WHERE user_id = {data['to_id']}"
+            )
+            db.commit()
+
+    return jsonify({'status': 'transferred'})
+
+
+# =====================================================================
+# FUNCTIONAL CORRECTNESS: Off-by-One in Pagination
+# =====================================================================
+
+@app.route('/api/invoices', methods=['GET'])
+@require_auth
+def list_invoices():
+    """
+    FUNCTIONAL CORRECTNESS — Off-by-One Error
+
+    page_size * page is used as the offset for page 1, which skips the
+    first page_size records instead of starting at record 0. Page 1
+    should have offset 0.
+    """
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 20))
+
+    # BUG: offset should be (page - 1) * page_size
+    offset = page * page_size
+
+    db = get_db()
+    rows = db.execute(
+        f"SELECT * FROM invoices WHERE user_id = {g.current_user['user_id']} "
+        f"LIMIT {page_size} OFFSET {offset}"
+    ).fetchall()
+
+    return jsonify([dict(r) for r in rows])
+
+
+# =====================================================================
+# FUNCTIONAL CORRECTNESS: Floating-Point Equality for Currency
+# =====================================================================
+
+@app.route('/api/invoices/<invoice_id>/mark-paid', methods=['POST'])
+@require_auth
+def mark_invoice_paid(invoice_id):
+    """
+    FUNCTIONAL CORRECTNESS — Floating-Point Equality Comparison
+
+    Compares the paid amount to the invoice total using ==. Floating
+    point arithmetic on currency values routinely produces values like
+    99.99999999999999, so exact equality silently fails and legitimate
+    full payments are left marked unpaid.
+    """
+    data = request.get_json()
+    paid_amount = data['paid_amount']
+
+    db = get_db()
+    invoice = db.execute(
+        f"SELECT total FROM invoices WHERE id = {invoice_id}"
+    ).fetchone()
+
+    # BUG: use a tolerance (e.g. abs(a - b) < 0.01) or integer cents instead
+    if paid_amount == invoice['total']:
+        db.execute(f"UPDATE invoices SET status = 'paid' WHERE id = {invoice_id}")
+        db.commit()
+        return jsonify({'status': 'paid'})
+
+    return jsonify({'status': 'partial_or_unpaid'})
+
+
+# =====================================================================
+# FUNCTIONAL CORRECTNESS: Inverted / Wrong Boolean Condition
+# =====================================================================
+
+@app.route('/api/users/<user_id>/access', methods=['GET'])
+@require_auth
+def check_access(user_id):
+    """
+    FUNCTIONAL CORRECTNESS — Inverted Condition
+
+    The intent is to deny access to suspended accounts, but the
+    condition is inverted: it grants access when is_suspended is True
+    and denies it otherwise.
+    """
+    db = get_db()
+    user = db.execute(f"SELECT is_suspended FROM users WHERE id = {user_id}").fetchone()
+
+    # BUG: condition is backwards — should be `if not user['is_suspended']`
+    if user['is_suspended']:
+        return jsonify({'access': 'granted'})
+
+    return jsonify({'access': 'denied'})
+
+
+# =====================================================================
+# DATA INTEGRITY: Missing Transaction / Partial Write on Failure
+# =====================================================================
+
+@app.route('/api/orders/create', methods=['POST'])
+@require_auth
+def create_order():
+    """
+    DATA INTEGRITY — No Transactional Boundary
+
+    Inserts the order header and its line items as separate,
+    non-atomic commits. If the process crashes or an exception is
+    raised between the two inserts, the database is left with an
+    order that has no items (or items with no parent order).
+    """
+    data = request.get_json()
+    db = get_db()
+
+    db.execute(
+        f"INSERT INTO orders (user_id, total) VALUES "
+        f"({g.current_user['user_id']}, {data['total']})"
+    )
+    db.commit()  # DATA INTEGRITY: committed before items are inserted
+
+    order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    for item in data['items']:
+        # If this raises (bad item, connection drop, etc.), the order
+        # above is already permanently committed with no items.
+        db.execute(
+            f"INSERT INTO order_items (order_id, sku, qty) VALUES "
+            f"({order_id}, '{item['sku']}', {item['qty']})"
+        )
+    db.commit()
+
+    return jsonify({'status': 'created', 'order_id': order_id})
+
+
+# =====================================================================
+# DATA INTEGRITY: API Response Schema Drift
+# =====================================================================
+
+@app.route('/api/users/<user_id>/profile', methods=['GET'])
+@require_auth
+def get_profile_v2(user_id):
+    """
+    DATA INTEGRITY / INTEGRATION — Undocumented Schema Change
+
+    Renames 'created_at' to 'createdAt' and changes 'balance' from a
+    numeric type to a formatted string, silently breaking any existing
+    client that deserializes this response against the documented v1
+    contract (numeric balance, snake_case created_at).
+    """
+    db = get_db()
+    user = db.execute(f"SELECT * FROM users WHERE id = {user_id}").fetchone()
+
     return jsonify({
-        'account': account_number,
-        'transactions': [dict(r) for r in rows]
+        'id': user['id'],
+        'createdAt': user['created_at'],          # was created_at (snake_case) in v1
+        'balance': f"${user['balance']:.2f}",      # was a raw float in v1
     })
 
 
 # =====================================================================
-# VULNERABILITY: CWE-614 — Sensitive Cookie Without 'Secure' Flag
-#                CWE-1004 — Sensitive Cookie Without 'HttpOnly' Flag
+# MAINTAINABILITY: Unclear Naming, Magic Numbers, Duplicated Logic
 # =====================================================================
 
-@app.route('/api/auth/remember-me', methods=['POST'])
-def remember_me():
+@app.route('/api/pricing/calc', methods=['POST'])
+@require_auth
+def calc():
     """
-    CRITICAL — CWE-614 + CWE-1004: Cookie security flags missing
+    MAINTAINABILITY — Poor Naming, Magic Numbers, Copy-Pasted Logic
 
-    Long-lived auth cookie set without Secure, HttpOnly, or SameSite.
-    Readable by JavaScript, sent over HTTP, vulnerable to CSRF.
+    Function and variable names give no indication of purpose. Tax and
+    discount rates are hardcoded magic numbers instead of named
+    constants or config. The discount/tax math is duplicated three
+    times with slight copy-paste variations instead of a shared helper.
+    """
+    d = request.get_json()
+    x = d['amt']
+    y = d['qty']
+    z = x * y
+
+    # MAINTAINABILITY: magic numbers with no explanation
+    if d.get('t') == 1:
+        z = z - (z * 0.15)
+        z = z + (z * 0.0825)
+    elif d.get('t') == 2:
+        z = z - (z * 0.10)  # duplicated discount logic, slightly different rate
+        z = z + (z * 0.0825)
+    else:
+        z = z + (z * 0.0825)  # duplicated tax logic again
+
+    return jsonify({'r': z})
+
+
+# =====================================================================
+# MAINTAINABILITY: Broad Exception Swallowing
+# =====================================================================
+
+@app.route('/api/webhooks/dispatch', methods=['POST'])
+@require_auth
+def dispatch_webhook():
+    """
+    MAINTAINABILITY / STABILITY — Bare Except Swallows All Errors
+
+    Catches every possible exception (including KeyboardInterrupt-style
+    and programming errors like TypeError/AttributeError) and silently
+    discards them, making failures invisible and impossible to debug.
     """
     data = request.get_json()
-    user_id = data.get('user_id')
 
-    # VULNERABLE: predictable token
-    token = hashlib.md5(f"{user_id}-remember-{int(time.time())}".encode()).hexdigest()
+    try:
+        _ = requests.post(data['callback_url'], json=data['payload'], timeout=5)
+    except:  # MAINTAINABILITY: bare except, no logging, no re-raise
+        pass
 
-    resp = make_response(jsonify({'status': 'remembered'}))
-
-    # VULNERABLE: missing secure=True, httponly=True, samesite='Strict'
-    resp.set_cookie(
-        'remember_token',
-        token,
-        max_age=60 * 60 * 24 * 365,  # 1 year — excessively long
-        # secure=False (default) — sent over HTTP
-        # httponly=False (default) — accessible via document.cookie
-        # samesite=None — no CSRF protection
-    )
-
-    return resp
-
-
-# =====================================================================
-# VULNERABILITY: CWE-116 — Log Injection / Log Forging
-# =====================================================================
-
-@app.route('/api/feedback', methods=['POST'])
-def submit_feedback():
-    """
-    MAJOR — CWE-117: Improper Output Neutralization for Logs
-
-    User input written directly into log files. Attacker injects
-    fake log entries or ANSI escape codes.
-    Exploit: {"message": "OK\\n[CRITICAL] Admin password changed by attacker"}
-    """
-    data = request.get_json()
-    message = data.get('message', '')
-    user = data.get('user', 'anonymous')
-
-    # VULNERABLE: newlines in message forge additional log lines
-    logging.info(f"FEEDBACK from {user}: {message}")
-
-    return jsonify({'status': 'received'})
-
-
-# =====================================================================
-# VULNERABILITY: CWE-829 — Inclusion of Untrusted Functionality
-# =====================================================================
-
-@app.route('/api/plugins/load', methods=['POST'])
-@require_admin
-def load_plugin():
-    """
-    CRITICAL — CWE-829: Inclusion of Functionality from Untrusted Source
-    CRITICAL — CWE-94:  Improper Control of Code Generation (eval)
-
-    Downloads and executes arbitrary Python from a user-supplied URL.
-    """
-    import urllib.request
-
-    plugin_url = request.get_json().get('url')
-
-    # VULNERABLE: fetches and executes code from any URL
-    code = urllib.request.urlopen(plugin_url).read().decode()
-    exec(code)  # VULNERABLE: arbitrary code execution
-
-    return jsonify({'status': 'plugin_loaded', 'source': plugin_url})
+    return jsonify({'status': 'dispatched'})
