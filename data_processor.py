@@ -33,12 +33,20 @@ def list_orders_with_items():
         f"SELECT * FROM orders WHERE user_id = {g.current_user['user_id']}"
     ).fetchall()
 
+    order_ids = [order['id'] for order in orders]
+    items_by_order = {}
+    if order_ids:
+        placeholders = ', '.join('?' for _ in order_ids)
+        items = db.execute(
+            f"SELECT * FROM order_items WHERE order_id IN ({placeholders})",
+            order_ids,
+        ).fetchall()
+        for item in items:
+            items_by_order.setdefault(item['order_id'], []).append(item)
+
     result = []
     for order in orders:
-        # PERFORMANCE: one query per row inside the loop
-        items = db.execute(
-            f"SELECT * FROM order_items WHERE order_id = {order['id']}"
-        ).fetchall()
+        items = items_by_order.get(order['id'], [])
         result.append({'order': dict(order), 'items': [dict(i) for i in items]})
 
     return jsonify(result)
